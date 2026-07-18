@@ -8,7 +8,7 @@ NC='\033[0m'
 echo -e "${CYAN}🚀 开始执行 GVF 先验消融实验...${NC}"
 
 # 设置通用的基础参数 (确保除了 GVF 权重外，其他变量完全一致)
-TARGET_CURVES=1024
+TARGET_CURVES=2048
 L1_W=1.0
 L2_W=1.0
 SSIM_W=1.0
@@ -34,7 +34,7 @@ python scripts/main.py \
 echo -e "\n${GREEN}>>> [2/2] 运行 w/ GVF (snake_w = 0.5)${NC}"
 python scripts/main.py \
     --exp_name "GVF_Ablation_w_GVF" \
-    --snake_w 0.5 \
+    --snake_w 10.0 \
     --lambda_w $WIDTH_W \
     --l1_weight $L1_W \
     --l2_weight $L2_W \

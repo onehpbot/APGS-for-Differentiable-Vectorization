@@ -24,7 +24,7 @@ from torchmetrics.functional.image import structural_similarity_index_measure as
 # 从其他模块导入
 from config import Config as cfg
 from dataset import VectorizationDataset
-from utils import export_standard_svg, save_gvf_visualization
+from utils import *
 from renderer import CUDABezierRenderer
 from model import MultiCurveFitter, prune_by_opacity_threshold, sample_new_curves, apply_resize, make_optimizer
 from snake_prior import SnakePrior
@@ -61,10 +61,19 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
 
     pbar = tqdm(range(cfg.NUM_EPOCHS + 1), desc=f"Training [{img_name}]", dynamic_ncols=True, leave=False)
 
+    warmup_epochs = int(cfg.NUM_EPOCHS * 0.9)
+
     for epoch in pbar:
         optimizer.zero_grad()
         cp, thickness, color, opacity = fitter.get_params()
         progress = epoch / cfg.NUM_EPOCHS
+        
+        if epoch < warmup_epochs:
+            # 线性增加：从 0 平滑过渡到传入的 target snake_w
+            current_snake_w = cfg.SNAKE_W * (epoch / warmup_epochs)
+        else:
+            # 预热结束，保持稳定权重
+            current_snake_w = cfg.SNAKE_W
         
         current_sigma = cfg.SIGMA_START * (cfg.SIGMA_END / cfg.SIGMA_START) ** progress
         current_tau_op = cfg.TAU_OP_START * (cfg.TAU_OP_END / cfg.TAU_OP_START) ** progress
@@ -74,13 +83,17 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
         snake_loss = SnakePrior.compute_loss(mu_tensor, force_field)
         wr = fitter.width_reg()
         
-        loss = render_loss + cfg.SNAKE_W * snake_loss + cfg.LAMBDA_W * wr + cfg.LAMBDA_OPL1 * opacity.mean()
+        loss = render_loss + current_snake_w * snake_loss + cfg.LAMBDA_W * wr + cfg.LAMBDA_OPL1 * opacity.mean()
         loss.backward()
         
         torch.nn.utils.clip_grad_norm_(fitter.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
         
+        # pbar.set_postfix({
+        #     "Loss": f"{loss.item():.4f}", 
+        #     "Snake": f"{snake_loss.item():.6f}"
+        # })
         # === 定期记录收敛指标 ===
         if epoch % log_interval == 0:
             with torch.no_grad():
@@ -115,7 +128,7 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
                 optimizer = make_optimizer(fitter, lr=cur_lr)
                 scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, cfg.NUM_EPOCHS - epoch), eta_min=cfg.LR_MIN)
 
-    # ================= 导出文件与可视化 =================
+# ================= 导出文件与可视化 =================
     # 保存指标 JSON 文件
     json_path = os.path.join(save_dir, f"{img_name}_metrics_history.json")
     with open(json_path, "w") as f:
@@ -134,26 +147,40 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
         tgt_lpips = tgt_t * 2.0 - 1.0
         val_lpips = lpips_vgg(pred_lpips, tgt_lpips).item()
 
+    # 获取优化完成的参数并转为 numpy
     final_cp, final_thickness, final_color, final_opacity = [x.detach().cpu().numpy() for x in fitter.get_params()]
     
-    # === 导出 GVF 场与曲线贴合图 ===
-    # 假设 force_field 形状为 (2, H, W)，将其转换为 (H, W, 2)
+    # 准备可视化所需的数据格式
     gvf_np = force_field.squeeze().permute(1, 2, 0).detach().cpu().numpy()
-    # 展平控制点为 (N*4, 2) 的格式送入可视化
-    pts_np = final_cp.reshape(-1, 2) 
-    save_gvf_visualization(gvf_np, pts_np, os.path.join(save_dir, f"{img_name}_gvf_vis.png"))
+    target_img_np = target_img_permuted.detach().cpu().numpy()
     
+    # 1. 导出图像边界图 (Ground Truth Edge)
+    # save_image_boundary(target_img_np, os.path.join(save_dir, f"{img_name}_boundary.png"))
+    
+    # 2. 导出梯度热力图 (GVF Magnitude)
+    # save_gradient_heatmap(gvf_np, os.path.join(save_dir, f"{img_name}_gvf_heatmap.png"))
+    
+    # 3. 导出曲线边界覆盖图 (Wireframe over Heatmap)
+    # save_curve_boundary_overlay(gvf_np, final_cp, os.path.join(save_dir, f"{img_name}_curve_overlay.png"))
+    
+    # (保留你原有的散点流线图对比)
+    # pts_np = final_cp.reshape(-1, 2) 
+    # save_gvf_visualization(gvf_np, pts_np, os.path.join(save_dir, f"{img_name}_gvf_stream.png"))
+    
+    # 渲染结果与 SVG 导出
     Image.fromarray((rendered.detach().cpu().numpy() * 255).astype(np.uint8)).save(os.path.join(save_dir, f"{img_name}_render.png"))
     
     svg_path = os.path.join(save_dir, f"{img_name}_vector.svg")
     export_standard_svg(svg_path, final_cp, final_thickness, final_color, final_opacity, W, H)
     
+    '''
     resvg_png_path = os.path.join(save_dir, f"{img_name}_svg_resvg.png")
     try:
         svg_content = open(svg_path, encoding='utf-8').read()
         Image.open(io.BytesIO(bytes(resvg_python.svg_to_png(svg_content)))).save(resvg_png_path)
     except Exception as e:
         print(f"⚠️ resvg 转换失败: {e}")
+    '''
 
     return val_psnr, val_ssim, val_lpips, opt_mins
 
@@ -209,7 +236,7 @@ if __name__ == '__main__':
     
     # Group B: 拓扑优化策略
     parser.add_argument('--enable_densify', type=int, default=1, help="1开启自适应剪枝, 0关闭")
-    parser.add_argument('--enable_hierarchical', type=int, default=1, help="1开启层次释放, 0关闭")
+    parser.add_argument('--enable_hierarchical', type=int, default=0, help="1开启层次释放, 0关闭")
     
     # Group C: 曲线数量
     parser.add_argument('--target_curves', type=int, default=1024, help="最终期望的曲线数量")
