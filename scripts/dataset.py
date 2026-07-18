@@ -1,4 +1,5 @@
 import os
+import glob
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -9,24 +10,26 @@ class VectorizationDataset(Dataset):
     """
     用于可微矢量化任务的标准图像数据集。
     支持自适应下采样：仅当图像长边超过 max_res 时，才保持比例进行下采样。
+    支持递归：data_dir 下的多层子文件夹都会被扫描（适配"dataset/类别/图片"结构）。
     """
     def __init__(self, data_dir, max_res=800):
         """
-        :param data_dir: 存放测试图像的文件夹路径
+        :param data_dir: 存放测试图像的文件夹路径（递归扫描所有子目录）
         :param max_res: 限制的最大分辨率（长边像素）。超过此值才会触发等比例下采样。
         """
         super().__init__()
         self.data_dir = data_dir
         self.max_res = max_res
-        
+
         valid_exts = ('.png', '.jpg', '.jpeg', '.bmp')
-        self.image_paths = sorted([
-            os.path.join(data_dir, f) for f in os.listdir(data_dir)
-            if f.lower().endswith(valid_exts)
-        ])
-        
+        # 递归收集所有子目录下的图像（大小写不敏感、只保留文件）
+        all_paths = glob.glob(os.path.join(data_dir, '**', '*'), recursive=True)
+        self.image_paths = sorted(
+            [p for p in all_paths if p.lower().endswith(valid_exts) and os.path.isfile(p)]
+        )
+
         if len(self.image_paths) == 0:
-            print(f"⚠️ 警告：在 {data_dir} 中未找到任何图像文件！")
+            print(f"⚠️ 警告：在 {data_dir}（含子目录）中未找到任何图像文件！")
 
     def __len__(self):
         return len(self.image_paths)
@@ -56,6 +59,8 @@ class VectorizationDataset(Dataset):
         ])
         
         img_tensor = transform(img)
-        img_name = os.path.splitext(os.path.basename(img_path))[0]
-        
+        # 用相对路径做唯一名（多子文件夹防冲突）：cat1/img.png -> cat1_img；直接在 data_dir 下则仍是原名
+        rel = os.path.relpath(img_path, self.data_dir)
+        img_name = os.path.splitext(rel)[0].replace(os.sep, '_')
+
         return img_tensor, img_name, new_H, new_W

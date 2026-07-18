@@ -44,10 +44,14 @@ def prune_by_opacity_threshold(fitter, tau_opacity):
             keep[idx] = True
         return keep, N - keep.sum().item()
 
-def sample_new_curves(err, target, n_new, device, thin_min=0.002, thin_max=0.008):
+def sample_new_curves(err, target, n_new, device, force_field=None, thin_min=0.002, thin_max=0.008):
     H, W = err.shape
     err_np = err.detach().cpu().numpy()
     tgt_np = target.detach().cpu().numpy()
+    # GVF 力场（可选）：用于把新曲线沿局部边缘切向定向。force_field: (1,2,H,W)，通道0=Ex、1=Ey。
+    F_np = None
+    if force_field is not None:
+        F_np = force_field.detach().squeeze(0).permute(1, 2, 0).cpu().numpy()  # (H,W,2)
     thr = max(float(np.quantile(err_np, 0.90)), float(err_np.mean()) * 1.5)
     mask = err_np > thr
     labeled, n_cc = ndimage.label(mask)
@@ -69,9 +73,15 @@ def sample_new_curves(err, target, n_new, device, thin_min=0.002, thin_max=0.008
         x0, x1 = max(0, int(cx - r)), min(W, int(cx + r))
         nx, ny = cx / W, cy / H
         
-        theta = math.pi / 4.0
         length = 0.03
-        dx, dy = math.cos(theta), math.sin(theta)
+        # 默认 45°；若提供 GVF 力场，则沿局部边缘切向（⊥力场法向）定向，让新笔画贴边
+        dx, dy = math.cos(math.pi / 4.0), math.sin(math.pi / 4.0)
+        if F_np is not None:
+            xi_c = int(min(max(cx, 0.0), W - 1)); yi_c = int(min(max(cy, 0.0), H - 1))
+            fx, fy = float(F_np[yi_c, xi_c, 0]), float(F_np[yi_c, xi_c, 1])
+            fn = math.hypot(fx, fy)
+            if fn > 1e-3:
+                dx, dy = -fy / fn, fx / fn  # 边缘切向 = 力场法向的垂直方向
         sx, sy = nx, ny
         ex, ey = sx + length * dx, sy + length * dy
         

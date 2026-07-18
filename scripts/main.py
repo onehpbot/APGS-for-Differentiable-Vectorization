@@ -35,7 +35,8 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
     单张图像优化，并返回 (PSNR, SSIM, LPIPS, OPT_Time_in_mins)
     """
     print(f"\n🚀 开始处理: {img_name} | {W}x{H}")
-    start_time = time.time()  
+    start_time = time.time()
+    torch.manual_seed(args.seed); np.random.seed(args.seed)  
     
     target_img = target_img.to(cfg.DEVICE)
     target_img_permuted = target_img.permute(1, 2, 0)
@@ -48,7 +49,8 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
         "iteration": [],
         "psnr": [],
         "ssim": [],
-        "loss": []
+        "loss": [],
+        "snake": []
     }
 
     fitter = MultiCurveFitter(num_curves=cfg.INITIAL_CURVES, w_max=cfg.W_MAX).to(cfg.DEVICE)
@@ -57,11 +59,13 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.NUM_EPOCHS, eta_min=cfg.LR_MIN)
     
     force_field = SnakePrior.compute_prior_gradient(target_img, kernel_size=25, sigma=8.0)
+    # densify 结构引导用的力场：受 --gvf_guided_densify 开关控制（snake_loss 仍用 force_field）
+    guidance_field = force_field if args.gvf_guided_densify else None
     loss_fn = ImageReconstructionLoss(l1_weight=cfg.L1_WEIGHT, l2_weight=cfg.L2_WEIGHT, ssim_weight=cfg.SSIM_WEIGHT).to(cfg.DEVICE)
 
     pbar = tqdm(range(cfg.NUM_EPOCHS + 1), desc=f"Training [{img_name}]", dynamic_ncols=True, leave=False)
 
-    warmup_epochs = int(cfg.NUM_EPOCHS * 0.9)
+    warmup_epochs = int(cfg.NUM_EPOCHS * cfg.WARMUP_FRAC)
 
     for epoch in pbar:
         optimizer.zero_grad()
@@ -106,12 +110,13 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
                 metrics_history["psnr"].append(float(cur_psnr))
                 metrics_history["ssim"].append(float(cur_ssim))
                 metrics_history["loss"].append(float(loss.item()))
+                metrics_history["snake"].append(float(snake_loss.item()))
                 
         if epoch > 0 and epoch % cfg.RELEASE_INTERVAL == 0 and fitter.num_curves < cfg.TARGET_CURVES:
             with torch.no_grad():
                 err = (rendered - target_img_permuted).abs().mean(-1)
                 to_add = min(cfg.CURVES_PER_RELEASE, cfg.TARGET_CURVES - fitter.num_curves)
-                new_cp, nrt, nrc, nro = sample_new_curves(err, target_img_permuted, to_add, cfg.DEVICE)
+                new_cp, nrt, nrc, nro = sample_new_curves(err, target_img_permuted, to_add, cfg.DEVICE, force_field=guidance_field)
                 apply_resize(fitter, torch.ones(fitter.num_curves, dtype=torch.bool, device=cfg.DEVICE), new_cp, nrt, nrc, nro)
                 cur_lr = optimizer.param_groups[0]['lr']
                 optimizer = make_optimizer(fitter, lr=cur_lr)
@@ -122,7 +127,7 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
                 err = (rendered - target_img_permuted).abs().mean(-1)
             keep, n_pruned = prune_by_opacity_threshold(fitter, current_tau_op)
             if n_pruned > 0:
-                new_cp, nrt, nrc, nro = sample_new_curves(err, target_img_permuted, n_pruned, cfg.DEVICE)
+                new_cp, nrt, nrc, nro = sample_new_curves(err, target_img_permuted, n_pruned, cfg.DEVICE, force_field=guidance_field)
                 apply_resize(fitter, keep, new_cp, nrt, nrc, nro)
                 cur_lr = optimizer.param_groups[0]['lr']
                 optimizer = make_optimizer(fitter, lr=cur_lr)
@@ -198,9 +203,14 @@ def run_experiment():
         name = img_name[0]
         tensor = img_tensor[0]
         H, W = H_tensor.item(), W_tensor.item()
-        
-        psnr, ssim, lpips_val, opt = fit_single_image(tensor, name, H, W, lpips_vgg, log_interval=args.log_interval)
-        
+        try:
+            psnr, ssim, lpips_val, opt = fit_single_image(tensor, name, H, W, lpips_vgg, log_interval=args.log_interval)
+        except Exception as e:
+            import traceback
+            print(f"⚠️ [{name}] 处理失败，跳过: {e}")
+            traceback.print_exc()
+            continue
+
         results.append({
             "Image": name,
             "SSIM": ssim,
@@ -241,6 +251,17 @@ if __name__ == '__main__':
     # Group C: 曲线数量
     parser.add_argument('--target_curves', type=int, default=1024, help="最终期望的曲线数量")
     parser.add_argument('--log_interval', type=int, default=50, help="记录指标的间隔步数")
+
+    # 运行环境（本机调试用）
+    parser.add_argument('--data_dir', type=str, default=None, help="数据集目录（默认 config.DATA_DIR）")
+    parser.add_argument('--num_epochs', type=int, default=None, help="训练轮数（默认 config.NUM_EPOCHS）")
+
+    # GVF 结构引导开关：1=densify 新曲线用 GVF 力场沿边缘切向定向；0=纯误差图撒种（关闭 GVF 结构引导）。
+    # 与 snake_w 解耦：snake_w 控制 GVF 损失，本开关控制 densify 定向。两者都关才是真正的 w/o GVF。
+    parser.add_argument('--gvf_guided_densify', type=int, default=1)
+
+    # 随机种子：固定 init + densify 随机性，让 with/without 对比只受 GVF 影响（默认 0）。
+    parser.add_argument('--seed', type=int, default=0)
     
     args = parser.parse_args()
     
@@ -252,6 +273,12 @@ if __name__ == '__main__':
     # 应用几何先验配置
     cfg.SNAKE_W = args.snake_w
     cfg.LAMBDA_W = args.lambda_w
+
+    # 运行环境覆盖
+    if args.data_dir:
+        cfg.DATA_DIR = args.data_dir
+    if args.num_epochs:
+        cfg.NUM_EPOCHS = args.num_epochs
     
     # 应用拓扑策略
     cfg.DENSIFY = bool(args.enable_densify)

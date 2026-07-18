@@ -21,6 +21,10 @@ class Config:
     NUM_EPOCHS = 5000
     LR = 0.01
     LR_MIN = 1e-5
+    # GVF/Snake 权重线性预热：在前 WARMUP_FRAC·NUM_EPOCHS 步内从 0 线性增到 SNAKE_W。
+    # 设 0.0 即禁用预热（snake_w 全程恒定）。注意不要设太大（如旧的 0.9）——
+    # cosine LR 在后期已衰减到 ~1e-5，warmup 拖到后期会让 GVF 同时"满权重×近零学习率"，等于失效。
+    WARMUP_FRAC = 0.1
     
     # 损失函数权重
     W_MAX = 0.01
@@ -34,7 +38,10 @@ class Config:
     # 动态拓扑控制 (Prune & Densify)
     DENSIFY = True
     DENSIFY_INTERVAL = 500
-    STOP_BEFORE = 5000
+    # densify 在 epoch < NUM_EPOCHS - STOP_BEFORE 期间触发。原值 5000==NUM_EPOCHS → 条件恒假，
+    # densify 从不运行（所有消融其实跑的是静态曲线）。改为 500，让 densify 在 500..4500 期间生效，
+    # 给 GVF 一个结构通道（新曲线可沿边缘切向定向、落点）。
+    STOP_BEFORE = 500
     SIGMA_START = 0.002
     SIGMA_END = 0.0001
     TAU_OP_START = 0.02

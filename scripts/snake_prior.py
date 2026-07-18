@@ -20,11 +20,18 @@ class SnakePrior:
         return gaussian_kernel.view(1, 1, kernel_size, kernel_size).to(device)
 
     @staticmethod
-    def compute_prior_gradient(target_img_tensor, kernel_size=21, sigma=5.0):
+    def compute_prior_gradient(target_img_tensor, kernel_size=21, sigma=5.0, normalize='global'):
         """
         接口1：计算全图的先验梯度引力场
         target_img_tensor: 目标图像 (3, H, W)
         返回: force_field (1, 2, H, W) 记录了全图每个像素受到的 (x, y) 轴拉力
+
+        normalize:
+          - 'global' (默认): 按全图最大幅值缩放到 [0,1]。保留"远处弱→近处强→边缘脊线处归零"
+            的吸引盆地形状，边缘脊线处 |F|→0 形成稳态，点能真正贴边停下。
+          - 'unit': 旧行为，逐像素 force/|force|。会把整个边缘带压成恒≈1 的饱和场，
+            边缘上不归零 → 无稳态、点被来回推。仅保留用于对比/消融。
+          - 'none': 不归一化（原始 ∇E，幅值差异大，需重调 snake_w）。
         """
         device = target_img_tensor.device
         
@@ -53,11 +60,17 @@ class SnakePrior:
         Ey = F.conv2d(F.pad(edge_energy, (1, 1, 1, 1), mode='replicate'), sobel_y)
         
         force_field = torch.cat([Ex, Ey], dim=1) # (1, 2, H, W)
-        
-        # 软归一化：保留拉力方向，防止梯度爆炸，且极度平坦区的拉力自然衰减为 0
-        norm = torch.norm(force_field, dim=1, keepdim=True)
-        force_field = force_field / (norm + 1e-5)
-        
+
+        if normalize == 'unit':
+            # 旧行为：逐像素单位化。边缘带内恒≈1、边缘上不归零 → 无稳态。
+            norm = torch.norm(force_field, dim=1, keepdim=True)
+            force_field = force_field / (norm + 1e-5)
+        elif normalize == 'global':
+            # 保留盆地形状，仅按全局最大幅值缩放到 [0,1]；边缘脊线处自然→0。
+            global_max = torch.norm(force_field, dim=1).max()
+            force_field = force_field / (global_max + 1e-8)
+        # normalize == 'none'：保持原始 ∇E
+
         return force_field
 
     @staticmethod
