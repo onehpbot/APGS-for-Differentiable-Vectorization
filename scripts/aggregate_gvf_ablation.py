@@ -124,6 +124,58 @@ def main():
     e_w, se_w = ep_to_frac(w_norm, 0.9)
     log(f"  到达 90% 终值: w/o={e_wo:.0f}±{se_wo:.0f}ep  w/={e_w:.0f}±{se_w:.0f}ep  Δ={e_w-e_wo:+.0f}ep  {'→ GVF 更快' if e_w<e_wo else '→ GVF 不更快'}")
 
+    # ---------- 按数据集拆分（质量 + 收敛）----------
+    def dataset_of(name):
+        return str(name).split("_", 1)[0]
+    ds_of = {n: dataset_of(n) for n in common_img}
+    datasets = sorted(set(ds_of.values()), key=lambda d: -sum(1 for n in common_img if ds_of[n] == d))
+
+    def stars(m, s):
+        return "★" if abs(m) > 2 * s else " "
+
+    log("\n—— 按数据集拆分 ——")
+    log("  [质量] (mean±sem, ★=|Δ|>2sem)")
+    log(f"  {'dataset':<14}{'n':>5}  {'PSNR wo→w':>15}  {'dPSNR':>14}{'%>0':>5}  {'dSSIM':>12}  {'dLPIPS':>12}")
+    ds_rows = []
+    for ds in datasets:
+        idx = [n for n in common_img if ds_of[n] == ds]
+        if len(idx) < 2:
+            continue
+        pw = wo.loc[idx, "PSNR"].values; pwf = w.loc[idx, "PSNR"].values
+        dp = pwf - pw
+        dsim = w.loc[idx, "SSIM"].values - wo.loc[idx, "SSIM"].values
+        dlp = w.loc[idx, "LPIPS"].values - wo.loc[idx, "LPIPS"].values
+        mp, sp = dp.mean(), sem(dp); ms, ss = dsim.mean(), sem(dsim); ml, sl = dlp.mean(), sem(dlp)
+        ds_rows.append(dict(dataset=ds, n=len(idx), PSNR_wo=float(pw.mean()), PSNR_w=float(pwf.mean()),
+                            dPSNR=float(mp), dPSNR_sem=float(sp), pct_better=float((dp > 0).mean() * 100),
+                            dSSIM=float(ms), dSSIM_sem=float(ss), dLPIPS=float(ml), dLPIPS_sem=float(sl)))
+        log(f"  {ds:<14}{len(idx):>5}  {pw.mean():>6.3f}→{pwf.mean():.3f}  {mp:>+8.3f}±{sp:.3f}{stars(mp, sp)}{(dp > 0).mean() * 100:>4.0f}%  {ms:>+7.4f}{stars(ms, ss)}  {ml:>+8.4f}{stars(ml, sl)}")
+
+    log("\n  [收敛] PSNR@1000/@2000/终 / AUC（各数据集内部 w/o vs w/）")
+    log(f"  {'dataset':<14}{'n':>5}  {'@1000 wo→w':>15}  {'@2000 wo→w':>15}  {'终 wo→w':>13}  {'AUCΔ%':>8}")
+    for ds in datasets:
+        idx = [n for n in img_trace if ds_of.get(n) == ds]
+        if len(idx) < 2:
+            continue
+        L = min(len(wo_t[n]["psnr"]) for n in idx)
+        it_ds = np.asarray(wo_t[idx[0]]["iteration"][:L])
+        wo_p = np.array([wo_t[n]["psnr"][:L] for n in idx], float)
+        w_p = np.array([w_t[n]["psnr"][:L] for n in idx], float)
+
+        def at(arr, e):
+            i = int(np.argmin(np.abs(it_ds - e))); return arr[:, i].mean()
+        auc_wo = _trap(wo_p, it_ds, axis=1).mean(); auc_w = _trap(w_p, it_ds, axis=1).mean()
+        for r in ds_rows:
+            if r["dataset"] == ds:
+                r.update(p1000_wo=float(at(wo_p, 1000)), p1000_w=float(at(w_p, 1000)),
+                         p2000_wo=float(at(wo_p, 2000)), p2000_w=float(at(w_p, 2000)),
+                         pfinal_wo=float(wo_p[:, -1].mean()), pfinal_w=float(w_p[:, -1].mean()),
+                         auc_wo=float(auc_wo), auc_w=float(auc_w), auc_dP=float((auc_w - auc_wo) / auc_wo * 100))
+        log(f"  {ds:<14}{len(idx):>5}  {at(wo_p,1000):>6.3f}→{at(w_p,1000):.3f}  {at(wo_p,2000):>6.3f}→{at(w_p,2000):.3f}  {wo_p[:,-1].mean():>5.3f}→{w_p[:,-1].mean():.3f}  {(auc_w-auc_wo)/auc_wo*100:>+7.2f}%")
+    if ds_rows:
+        pd.DataFrame(ds_rows).to_csv(os.path.join(args.out, "by_dataset.csv"), index=False, float_format="%.4f")
+        log(f"\n  按数据集明细已存: {os.path.join(args.out, 'by_dataset.csv')}")
+
     # ---------- 3. 画图 ----------
     fig, ax = plt.subplots(1, 3, figsize=(17, 4.6))
     # (a) 原始 PSNR 曲线
@@ -156,6 +208,26 @@ def main():
     png = os.path.join(args.out, "convergence.png")
     plt.savefig(png, dpi=160, bbox_inches="tight")
     log(f"\n图已存: {png}")
+
+    # 按数据集：@2000ep（早期）与终值（晚期）w/o vs w/，看"早期是否同速、晚期是否领先"
+    if ds_rows:
+        fig3, ax3 = plt.subplots(1, 2, figsize=(13, 4.6))
+        names_ds = [r["dataset"] for r in ds_rows]
+        x = np.arange(len(names_ds)); wdt = 0.38
+        ax3[0].bar(x - wdt / 2, [r.get("p2000_wo", np.nan) for r in ds_rows], wdt, color="#ff7f0e", label="w/o GVF")
+        ax3[0].bar(x + wdt / 2, [r.get("p2000_w", np.nan) for r in ds_rows], wdt, color="#1f77b4", label="w/ GVF")
+        ax3[0].set_xticks(x); ax3[0].set_xticklabels(names_ds, rotation=15, ha="right")
+        ax3[0].set_ylabel("PSNR @2000ep"); ax3[0].set_title("early convergence by dataset")
+        ax3[0].grid(alpha=0.3, axis="y"); ax3[0].legend(fontsize=8)
+        ax3[1].bar(x - wdt / 2, [r["PSNR_wo"] for r in ds_rows], wdt, color="#ff7f0e", label="w/o GVF")
+        ax3[1].bar(x + wdt / 2, [r["PSNR_w"] for r in ds_rows], wdt, color="#1f77b4", label="w/ GVF")
+        ax3[1].set_xticks(x); ax3[1].set_xticklabels(names_ds, rotation=15, ha="right")
+        ax3[1].set_ylabel("final PSNR"); ax3[1].set_title("final quality by dataset")
+        ax3[1].grid(alpha=0.3, axis="y"); ax3[1].legend(fontsize=8)
+        plt.tight_layout()
+        png3 = os.path.join(args.out, "by_dataset.png")
+        plt.savefig(png3, dpi=160, bbox_inches="tight")
+        log(f"按数据集图已存: {png3}")
 
     with open(os.path.join(args.out, "summary.txt"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
