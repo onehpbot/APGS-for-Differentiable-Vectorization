@@ -5,7 +5,7 @@ class Config:
     DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # IO 与 数据集配置
-    DATA_DIR = rf"/data/workspace_PH/dataset/AP"  
+    DATA_DIR = rf"/data/workspace_PH/test_dataset/"  
     OUT_DIR = rf"output/"                
     MAX_RES = 800
     # 🌟 图像下采样配置 (例如 0.5 表示宽高减半；1.0 表示使用原图)

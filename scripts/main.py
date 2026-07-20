@@ -177,17 +177,26 @@ def fit_single_image(target_img, img_name, H, W, lpips_vgg, log_interval=50):
     
     svg_path = os.path.join(save_dir, f"{img_name}_vector.svg")
     export_standard_svg(svg_path, final_cp, final_thickness, final_color, final_opacity, W, H)
-    
-    '''
-    resvg_png_path = os.path.join(save_dir, f"{img_name}_svg_resvg.png")
+
+    # === SVG 一致性两组指标（resvg 栅格化 SVG）===
+    # cPSNR/cSSIM = CUDA vs SVG     （方案A：渲染器↔矢量直接误差）
+    # sPSNR/sSSIM = SVG  vs GT      （方案B：与 PSNR=CUDA vs GT 对照，差距=SVG 相对 CUDA 丢了多少）
+    c_psnr = c_ssim = s_psnr = s_ssim = float('nan')
     try:
         svg_content = open(svg_path, encoding='utf-8').read()
-        Image.open(io.BytesIO(bytes(resvg_python.svg_to_png(svg_content)))).save(resvg_png_path)
+        resvg_arr = np.array(Image.open(io.BytesIO(bytes(resvg_python.svg_to_png(svg_content)))).convert('RGB'))
+        Image.fromarray(resvg_arr).save(os.path.join(save_dir, f"{img_name}_svg_resvg.png"))
+        svg_t = torch.from_numpy(resvg_arr).permute(2, 0, 1).unsqueeze(0).float().div(255.0).clamp(0, 1).to(cfg.DEVICE)
+        cuda_t = rendered.detach().permute(2, 0, 1).unsqueeze(0).clamp(0, 1)
+        tgt_t = target_img.unsqueeze(0).clamp(0, 1)
+        c_psnr = psnr_metric(svg_t, cuda_t, data_range=1.0).item()
+        c_ssim = ssim_metric(svg_t, cuda_t, data_range=1.0).item()
+        s_psnr = psnr_metric(svg_t, tgt_t, data_range=1.0).item()
+        s_ssim = ssim_metric(svg_t, tgt_t, data_range=1.0).item()
     except Exception as e:
-        print(f"⚠️ resvg 转换失败: {e}")
-    '''
+        print(f"⚠️ [{img_name}] SVG 一致性指标失败: {e}")
 
-    return val_psnr, val_ssim, val_lpips, opt_mins
+    return val_psnr, val_ssim, val_lpips, opt_mins, c_psnr, c_ssim, s_psnr, s_ssim
 
 def run_experiment():
     print(f"=== 开始实验: {cfg.OUT_DIR} ===")
@@ -204,7 +213,7 @@ def run_experiment():
         tensor = img_tensor[0]
         H, W = H_tensor.item(), W_tensor.item()
         try:
-            psnr, ssim, lpips_val, opt = fit_single_image(tensor, name, H, W, lpips_vgg, log_interval=args.log_interval)
+            psnr, ssim, lpips_val, opt, c_psnr, c_ssim, s_psnr, s_ssim = fit_single_image(tensor, name, H, W, lpips_vgg, log_interval=args.log_interval)
         except Exception as e:
             import traceback
             print(f"⚠️ [{name}] 处理失败，跳过: {e}")
@@ -216,9 +225,14 @@ def run_experiment():
             "SSIM": ssim,
             "PSNR": psnr,
             "LPIPS": lpips_val,
+            "cPSNR": c_psnr,      # 方案A: CUDA vs SVG
+            "cSSIM": c_ssim,
+            "sPSNR": s_psnr,      # 方案B: SVG vs GT（与 PSNR=CUDA vs GT 对照）
+            "sSSIM": s_ssim,
             "OPT(min)": opt
         })
-        print(f"[{name}] PSNR: {psnr:.2f} | SSIM: {ssim:.4f} | LPIPS: {lpips_val:.4f} | Time: {opt:.2f} min")
+        print(f"[{name}] PSNR: {psnr:.2f} | SSIM: {ssim:.4f} | LPIPS: {lpips_val:.4f} | "
+              f"cPSNR: {c_psnr:.2f} | sPSNR: {s_psnr:.2f} | Time: {opt:.2f} min")
 
     # ================= 写入 CSV 与求均值 =================
     df = pd.DataFrame(results)
@@ -262,6 +276,11 @@ if __name__ == '__main__':
 
     # 随机种子：固定 init + densify 随机性，让 with/without 对比只受 GVF 影响（默认 0）。
     parser.add_argument('--seed', type=int, default=0)
+
+    # σ_edge 退火（渲染锐度）：σ_px = σ·W。不传则用 config 默认 0.002→0.0001。
+    # 指数退火：σ(t)=start*(end/start)^(t/T)。越小=笔画边越硬。
+    parser.add_argument('--sigma_start', type=float, default=None)
+    parser.add_argument('--sigma_end', type=float, default=None)
     
     args = parser.parse_args()
     
@@ -279,6 +298,10 @@ if __name__ == '__main__':
         cfg.DATA_DIR = args.data_dir
     if args.num_epochs:
         cfg.NUM_EPOCHS = args.num_epochs
+    if args.sigma_start is not None:
+        cfg.SIGMA_START = args.sigma_start
+    if args.sigma_end is not None:
+        cfg.SIGMA_END = args.sigma_end
     
     # 应用拓扑策略
     cfg.DENSIFY = bool(args.enable_densify)
